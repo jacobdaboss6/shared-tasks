@@ -1,157 +1,102 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { supabase } from './lib/supabase'
+import LoginPage from './auth/LoginPage'
+import RandomizeTab from './tabs/RandomizeTab'
+import MonthsTab from './tabs/MonthsTab'
+import AuditTab from './tabs/AuditTab'
+import AdminPanel from './admin/AdminPanel'
+import { signOut } from './lib/auth'
 import './App.css'
 
-export default function App() {
-  const [tasks, setTasks] = useState([])
-  const [title, setTitle] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
-  const [adding, setAdding] = useState(false)
+const TABS = [
+  { id: 'randomize', label: 'Randomize' },
+  { id: 'months',    label: 'Months' },
+  { id: 'audit',     label: 'Audit' },
+]
 
+export default function App() {
+  const [session, setSession] = useState(null)
+  const [profile, setProfile] = useState(null)
+  const [booting, setBooting] = useState(true)
+  const [tab, setTab] = useState('audit')
+  const [showAdmin, setShowAdmin] = useState(false)
+
+  // Initial session + subscribe to auth changes.
   useEffect(() => {
     let cancelled = false
-
-    async function loadTasks() {
-      const { data, error } = await supabase
-        .from('tasks')
-        .select('*')
-        .order('created_at', { ascending: false })
-
+    supabase.auth.getSession().then(({ data }) => {
       if (cancelled) return
-
-      if (error) {
-        setError(error.message)
-      } else {
-        setTasks(data ?? [])
-        setError(null)
-      }
-      setLoading(false)
-    }
-
-    loadTasks()
-
-    const channel = supabase
-      .channel('tasks-changes')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'tasks' },
-        (payload) => {
-          setTasks((current) => {
-            if (payload.eventType === 'INSERT') {
-              if (current.some((t) => t.id === payload.new.id)) return current
-              return [payload.new, ...current].sort(
-                (a, b) => new Date(b.created_at) - new Date(a.created_at)
-              )
-            }
-            if (payload.eventType === 'UPDATE') {
-              return current.map((t) =>
-                t.id === payload.new.id ? payload.new : t
-              )
-            }
-            if (payload.eventType === 'DELETE') {
-              return current.filter((t) => t.id !== payload.old.id)
-            }
-            return current
-          })
-        }
-      )
-      .subscribe()
-
+      setSession(data.session ?? null)
+      setBooting(false)
+    })
+    const { data: sub } = supabase.auth.onAuthStateChange((_evt, s) => {
+      setSession(s ?? null)
+    })
     return () => {
       cancelled = true
-      supabase.removeChannel(channel)
+      sub.subscription.unsubscribe()
     }
   }, [])
 
-  async function addTask(e) {
-    e.preventDefault()
-    const trimmed = title.trim()
-    if (!trimmed || adding) return
+  // Load current user's profile row.
+  const userId = session?.user?.id ?? null
+  const loadProfile = useCallback(async () => {
+    if (!userId) { setProfile(null); return }
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, email, display_name, role')
+      .eq('id', userId)
+      .maybeSingle()
+    if (!error) setProfile(data ?? null)
+  }, [userId])
 
-    setAdding(true)
-    setError(null)
-    const { error } = await supabase.from('tasks').insert({ title: trimmed })
+  useEffect(() => { loadProfile() }, [loadProfile])
 
-    if (error) {
-      setError(error.message)
-    } else {
-      setTitle('')
-    }
-    setAdding(false)
-  }
+  if (booting) return <div className="shell-loading">Loading…</div>
+  if (!session) return <LoginPage />
 
-  async function toggleTask(task) {
-    const { error } = await supabase
-      .from('tasks')
-      .update({ completed: !task.completed })
-      .eq('id', task.id)
-
-    if (error) setError(error.message)
-  }
-
-  async function deleteTask(id) {
-    const { error } = await supabase.from('tasks').delete().eq('id', id)
-    if (error) setError(error.message)
-  }
+  const isAdmin = profile?.role === 'admin'
+  const displayName = profile?.display_name || profile?.email || 'you'
 
   return (
-    <div className="app">
-      <header className="app-header">
-        <h1>Shared Tasks</h1>
-        <p className="subtitle">Live-synced across every window.</p>
+    <div className="shell">
+      <header className="shell-header">
+        <div className="shell-brand">
+          <span className="shell-dot" />
+          <span>Brand Audit</span>
+        </div>
+        <nav className="shell-tabs" role="tablist">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={tab === t.id}
+              className={tab === t.id ? 'tab active' : 'tab'}
+              onClick={() => setTab(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+        <div className="shell-user">
+          {isAdmin && (
+            <button className="chip admin" onClick={() => setShowAdmin(true)}>
+              Admin
+            </button>
+          )}
+          <span className="shell-who" title={profile?.email}>{displayName}</span>
+          <button className="link" onClick={signOut}>Sign out</button>
+        </div>
       </header>
 
-      <form className="add-form" onSubmit={addTask}>
-        <input
-          type="text"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="What needs doing?"
-          aria-label="New task"
-          disabled={adding}
-        />
-        <button type="submit" disabled={adding || !title.trim()}>
-          {adding ? 'Adding…' : 'Add'}
-        </button>
-      </form>
+      <main className="shell-main">
+        {tab === 'randomize' && <RandomizeTab profile={profile} isAdmin={isAdmin} />}
+        {tab === 'months'    && <MonthsTab    profile={profile} isAdmin={isAdmin} />}
+        {tab === 'audit'     && <AuditTab     profile={profile} />}
+      </main>
 
-      {error && (
-        <div className="error" role="alert">
-          {error}
-        </div>
-      )}
-
-      {loading ? (
-        <div className="state">Loading tasks…</div>
-      ) : tasks.length === 0 ? (
-        <div className="state empty">No tasks yet. Add one above.</div>
-      ) : (
-        <ul className="tasks">
-          {tasks.map((task) => (
-            <li
-              key={task.id}
-              className={task.completed ? 'task done' : 'task'}
-            >
-              <label className="task-main">
-                <input
-                  type="checkbox"
-                  checked={task.completed}
-                  onChange={() => toggleTask(task)}
-                />
-                <span className="task-title">{task.title}</span>
-              </label>
-              <button
-                type="button"
-                className="delete"
-                onClick={() => deleteTask(task.id)}
-                aria-label={`Delete ${task.title}`}
-              >
-                ×
-              </button>
-            </li>
-          ))}
-        </ul>
+      {showAdmin && isAdmin && (
+        <AdminPanel onClose={() => { setShowAdmin(false); loadProfile() }} />
       )}
     </div>
   )
