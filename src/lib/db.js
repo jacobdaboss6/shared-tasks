@@ -20,7 +20,6 @@ export async function updateMyDisplayName(displayName) {
   if (error) throw error
 }
 
-// Admin only (RLS will reject for non-admins).
 export async function setProfileRole(profileId, role) {
   const { error } = await supabase
     .from('profiles')
@@ -73,7 +72,7 @@ export async function deleteBrand(brandId) {
 export async function listMonths() {
   const { data, error } = await supabase
     .from('months')
-    .select('id, label, month_num, year, is_active, created_at')
+    .select('id, label, month_num, year, is_active, is_frozen, created_at')
     .order('year', { ascending: false })
     .order('month_num', { ascending: false })
   if (error) throw error
@@ -83,20 +82,20 @@ export async function listMonths() {
 export async function getActiveMonth() {
   const { data, error } = await supabase
     .from('months')
-    .select('id, label, month_num, year, is_active')
+    .select('id, label, month_num, year, is_active, is_frozen')
     .eq('is_active', true)
     .maybeSingle()
   if (error) throw error
   return data
 }
 
-// Create a month *with* its assignments in one call. We can't do it in a
-// single SQL transaction from the client; instead we create the month, then
-// bulk-insert the assignments, and if that fails we best-effort roll back.
+// Create a month with its assignments + pre-seeded brand_checklist rows.
+// When setActive is true, the DB trigger auto-freezes the previous active
+// month as it flips to is_active=false.
 export async function createMonthWithAssignments({ label, month_num, year, distribution, setActive }) {
   const { data: month, error } = await supabase
     .from('months')
-    .insert({ label, month_num, year, is_active: false })
+    .insert({ label, month_num, year, is_active: false, is_frozen: false })
     .select()
     .single()
   if (error) throw error
@@ -110,24 +109,22 @@ export async function createMonthWithAssignments({ label, month_num, year, distr
   if (rows.length) {
     const { error: aerr } = await supabase.from('assignments').insert(rows)
     if (aerr) {
-      // Best-effort cleanup.
       await supabase.from('months').delete().eq('id', month.id)
       throw aerr
     }
   }
 
-  // Pre-create brand_checklist rows so owners can immediately mark progress.
+  // Pre-create brand_checklist rows at 'pending'. The INSERT trigger skips
+  // logging rows that land at pending (default), so no noise in the log.
   if (rows.length) {
-    const { data: inserted, error: ferr } = await supabase
+    const { data: inserted } = await supabase
       .from('assignments')
       .select('id')
       .eq('month_id', month.id)
-    if (!ferr && inserted) {
+    if (inserted) {
       await supabase
         .from('brand_checklist')
         .insert(inserted.map((a) => ({ assignment_id: a.id })))
-      // Ignore errors here — RLS may reject if somehow we're not admin; the
-      // row will be created on first status update anyway.
     }
   }
 
@@ -135,7 +132,8 @@ export async function createMonthWithAssignments({ label, month_num, year, distr
   return month
 }
 
-// Atomic-ish "set active": unset everything else, then set this one.
+// Atomic-ish "set active". Unset others (trigger freezes them as they flip
+// to is_active=false), then unfreeze + set the target.
 export async function setMonthActive(monthId) {
   const { error: e1 } = await supabase
     .from('months')
@@ -144,9 +142,14 @@ export async function setMonthActive(monthId) {
   if (e1) throw e1
   const { error: e2 } = await supabase
     .from('months')
-    .update({ is_active: true })
+    .update({ is_active: true, is_frozen: false })
     .eq('id', monthId)
   if (e2) throw e2
+}
+
+export async function setMonthFrozen(monthId, is_frozen) {
+  const { error } = await supabase.from('months').update({ is_frozen }).eq('id', monthId)
+  if (error) throw error
 }
 
 export async function renameMonth(monthId, label) {
@@ -160,6 +163,7 @@ export async function deleteMonth(monthId) {
 }
 
 // ------------------------------ ASSIGNMENTS -------------------------------
+// NB: RLS restricts members to their own rows. Admin sees all.
 export async function listAssignmentsForMonth(monthId) {
   const { data, error } = await supabase
     .from('assignments')
@@ -192,7 +196,6 @@ export async function listMyAssignmentsForMonth(monthId) {
 
 // ---------------------------- BRAND CHECKLIST -----------------------------
 export async function listBrandChecklistForMonth(monthId) {
-  // Join via assignments to filter by month.
   const { data, error } = await supabase
     .from('brand_checklist')
     .select(`
@@ -213,89 +216,176 @@ export async function upsertBrandChecklist({ assignment_id, status, notes }) {
   if (error) throw error
 }
 
-// ---------------------------- MODEL CHECKLIST -----------------------------
-export async function listModelChecklistForAssignments(assignmentIds) {
-  if (!assignmentIds.length) return []
+// ------------------------------ STATUS LOG --------------------------------
+// Admin sees all; members see only their own (RLS enforced server-side).
+export async function listStatusLog(filters = {}) {
+  let q = supabase
+    .from('status_log')
+    .select(`
+      id, changed_at, previous_status, new_status,
+      person_id, changed_by, month_id, brand_id,
+      brand:brands(id, name),
+      month:months(id, label, year, month_num)
+    `)
+    .order('changed_at', { ascending: false })
+
+  if (filters.monthId)    q = q.eq('month_id', filters.monthId)
+  if (filters.personId)   q = q.eq('person_id', filters.personId)
+  if (filters.brandId)    q = q.eq('brand_id', filters.brandId)
+  if (filters.fromStatus) q = q.eq('previous_status', filters.fromStatus)
+  if (filters.toStatus)   q = q.eq('new_status', filters.toStatus)
+  if (filters.since)      q = q.gte('changed_at', filters.since)
+  if (filters.until)      q = q.lte('changed_at', filters.until)
+  if (filters.limit)      q = q.limit(filters.limit)
+
+  const { data, error } = await q
+  if (error) throw error
+
+  // Hydrate person + changer from profiles (no FK, client-side join).
+  const ids = new Set()
+  for (const r of (data ?? [])) { ids.add(r.person_id); ids.add(r.changed_by) }
+  if (ids.size) {
+    const { data: profs } = await supabase
+      .from('profiles')
+      .select('id, email, display_name')
+      .in('id', [...ids])
+    const byId = new Map((profs ?? []).map((p) => [p.id, p]))
+    for (const r of (data ?? [])) {
+      r.person  = byId.get(r.person_id)  || null
+      r.changer = byId.get(r.changed_by) || null
+    }
+  }
+  return data ?? []
+}
+
+// --------------------------- INVENTORY SNAPSHOTS --------------------------
+export async function listInventorySnapshots(limit = 20) {
   const { data, error } = await supabase
-    .from('model_checklist')
-    .select('id, assignment_id, model, normalized_model, status, notes, updated_at')
-    .in('assignment_id', assignmentIds)
-    .order('model', { ascending: true })
+    .from('inventory_snapshots')
+    .select('id, uploaded_at, filename, row_count, uploaded_by')
+    .order('uploaded_at', { ascending: false })
+    .limit(limit)
   if (error) throw error
   return data ?? []
 }
 
-export async function upsertModelChecklist({ id, assignment_id, model, status, notes }) {
-  const { data: { user } } = await supabase.auth.getUser()
-  // If we have an id, update; otherwise insert (server-generated id).
-  if (id) {
-    const { error } = await supabase
-      .from('model_checklist')
-      .update({ status, notes, updated_by: user?.id ?? null })
-      .eq('id', id)
-    if (error) throw error
-  } else {
-    const { error } = await supabase
-      .from('model_checklist')
-      .insert({ assignment_id, model, status, notes, updated_by: user?.id ?? null })
-    if (error) throw error
-  }
+export async function getLatestSnapshot() {
+  const { data, error } = await supabase
+    .from('inventory_snapshots')
+    .select('id, uploaded_at, filename, row_count, uploaded_by')
+    .order('uploaded_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (error) throw error
+  return data
 }
 
-// Reconcile model_checklist for a set of assignments against an inventory.
-//   assignments: [{ id, brand: { normalized } }]
-//   inventoryRows: [{ normalizedBrand, normalizedModel, model }]
-// For each assignment, find inventory rows whose normalizedBrand matches;
-// upsert a model_checklist row per distinct normalized_model. Existing rows
-// keep their status/notes (only updated_at). Pending rows that no longer
-// appear in inventory are deleted. Touched rows (non-pending) are kept.
-export async function reconcileMonthModels({ assignments, inventoryRows }) {
-  const existing = await listModelChecklistForAssignments(assignments.map((a) => a.id))
+export async function getSnapshot(id) {
+  const { data, error } = await supabase
+    .from('inventory_snapshots')
+    .select('id, uploaded_at, filename, row_count, uploaded_by')
+    .eq('id', id)
+    .maybeSingle()
+  if (error) throw error
+  return data
+}
 
-  const existingByKey = new Map()
-  for (const row of existing) existingByKey.set(`${row.assignment_id}::${row.normalized_model}`, row)
-
-  const seenKeys = new Set()
-  const toInsert = []
-
-  for (const a of assignments) {
-    const brandNorm = a.brand?.normalized || ''
-    if (!brandNorm) continue
-    const rowsForBrand = inventoryRows.filter((r) => r.normalizedBrand === brandNorm)
-    const byModel = new Map()
-    for (const r of rowsForBrand) {
-      if (!r.normalizedModel) continue
-      if (!byModel.has(r.normalizedModel)) byModel.set(r.normalizedModel, r.model)
-    }
-    for (const [normModel, displayModel] of byModel) {
-      const key = `${a.id}::${normModel}`
-      seenKeys.add(key)
-      if (!existingByKey.has(key)) {
-        toInsert.push({ assignment_id: a.id, model: displayModel })
+// Creates a snapshot with its rows. Rolls back on partial failure.
+export async function createInventorySnapshot({ filename, rows }) {
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) throw new Error('Not signed in')
+  const { data: snap, error } = await supabase
+    .from('inventory_snapshots')
+    .insert({ uploaded_by: user.id, filename, row_count: rows.length })
+    .select()
+    .single()
+  if (error) throw error
+  if (rows.length) {
+    const CHUNK = 500
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK).map((r) => ({
+        snapshot_id: snap.id,
+        model: r.model || null,
+        brand_raw: r.brandRaw || null,
+        brand_normalized: r.brandNormalized || null,
+        committed: r.committed,
+        bucket: r.bucket || null,
+        qty: r.qty,
+        upc: r.upc || null,
+        mpn: r.mpn || null,
+      }))
+      const { error: rerr } = await supabase.from('inventory_rows').insert(chunk)
+      if (rerr) {
+        await supabase.from('inventory_snapshots').delete().eq('id', snap.id)
+        throw rerr
       }
     }
   }
+  return snap
+}
 
-  const toDelete = existing
-    .filter((r) => r.status === 'pending' && !seenKeys.has(`${r.assignment_id}::${r.normalized_model}`))
-    .map((r) => r.id)
+export async function listInventoryRowsForSnapshot(snapshotId, brandNormalizedList = null) {
+  let q = supabase
+    .from('inventory_rows')
+    .select('id, model, brand_raw, brand_normalized, committed, bucket, qty, upc, mpn')
+    .eq('snapshot_id', snapshotId)
+    .order('brand_normalized', { ascending: true })
+    .order('model', { ascending: true })
+    .order('bucket', { ascending: true })
 
-  // Apply.
-  if (toInsert.length) {
-    // Chunk to avoid huge payloads.
-    for (let i = 0; i < toInsert.length; i += 500) {
-      const chunk = toInsert.slice(i, i + 500)
-      const { error } = await supabase.from('model_checklist').insert(chunk)
-      if (error) throw error
-    }
+  if (brandNormalizedList?.length) q = q.in('brand_normalized', brandNormalizedList)
+
+  const { data, error } = await q
+  if (error) throw error
+  return data ?? []
+}
+
+// Unique brand codes in a snapshot — for unrecognized-brand detection.
+export async function listSnapshotBrandCodes(snapshotId) {
+  const { data, error } = await supabase
+    .from('inventory_rows')
+    .select('brand_normalized, brand_raw')
+    .eq('snapshot_id', snapshotId)
+  if (error) throw error
+  const seen = new Map()
+  for (const r of (data ?? [])) {
+    const k = r.brand_normalized || ''
+    if (!k) continue
+    if (!seen.has(k)) seen.set(k, { brand_normalized: k, brand_raw: r.brand_raw })
   }
-  if (toDelete.length) {
-    const { error } = await supabase.from('model_checklist').delete().in('id', toDelete)
-    if (error) throw error
-  }
-  return {
-    inserted: toInsert.length,
-    deleted: toDelete.length,
-    kept: existing.length - toDelete.length,
-  }
+  return [...seen.values()]
+}
+
+export async function deleteSnapshot(id) {
+  const { error } = await supabase.from('inventory_snapshots').delete().eq('id', id)
+  if (error) throw error
+}
+
+// --------------------------- ADMIN NOTIFICATIONS --------------------------
+export async function listAdminNotifications({ includeDismissed = false } = {}) {
+  let q = supabase
+    .from('admin_notifications')
+    .select('id, kind, payload, created_at, dismissed_at, dismissed_by')
+    .order('created_at', { ascending: false })
+    .limit(100)
+  if (!includeDismissed) q = q.is('dismissed_at', null)
+  const { data, error } = await q
+  if (error) throw error
+  return data ?? []
+}
+
+export async function dismissAdminNotification(id) {
+  const { data: { user } } = await supabase.auth.getUser()
+  const { error } = await supabase
+    .from('admin_notifications')
+    .update({ dismissed_at: new Date().toISOString(), dismissed_by: user?.id ?? null })
+    .eq('id', id)
+  if (error) throw error
+}
+
+export async function createAdminNotifications(items) {
+  if (!items.length) return
+  const rows = items.map((it) => ({ kind: it.kind, payload: it.payload }))
+  const { error } = await supabase.from('admin_notifications').insert(rows)
+  if (error) throw error
 }

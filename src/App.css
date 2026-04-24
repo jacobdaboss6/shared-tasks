@@ -311,3 +311,124 @@ textarea { width: 100%; min-height: 60px; resize: vertical; }
   .shell-tabs { order: 2; width: 100%; }
   .shell-user { order: 3; margin-left: auto; }
 }
+
+/* ========================= Frozen months ========================= */
+.month.is-frozen { border-color: #d2def7; background: #fafbfe; }
+.tag.frozen { background: #eef2fb; color: var(--accent); }
+.tag.danger { background: var(--danger-soft); color: var(--danger); }
+
+/* ========================= Chip badge ========================= */
+.chip { position: relative; }
+.chip-badge {
+  position: absolute; top: -6px; right: -6px;
+  min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 999px; background: var(--danger); color: #fff;
+  font-size: 11px; font-weight: 600; line-height: 18px; text-align: center;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+/* ========================= Snapshot banner ========================= */
+.snapshot-card .info.warn {
+  background: var(--warning-soft); color: var(--warning);
+  border: 1px solid #e8c98a;
+  display: flex; align-items: center; gap: 10px; justify-content: space-between;
+}
+.info.warn .mini { background: #fff; }
+
+/* ========================= Audit row additions ========================= */
+.audit-check { display: inline-flex; align-items: center; }
+.audit-check input { accent-color: var(--accent); width: 18px; height: 18px; }
+.audit-row-head strong { flex: 1; }
+.audit-row-head select { min-width: 130px; }
+
+/* ========================= Toast ========================= */
+.toast {
+  position: fixed; right: 16px; bottom: 16px; z-index: 30;
+  max-width: 420px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: var(--shadow-md);
+  padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.snapshot-toast { border-left: 4px solid var(--accent); }
+.toast-body { font-size: 14px; }
+.toast-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+/* ========================= Logs ========================= */
+.logs-filters {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  align-items: end;
+}
+.logs-filter-actions {
+  display: flex; gap: 6px; align-self: end; justify-content: flex-end;
+  grid-column: 1 / -1;
+}
+.logs-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.logs-table th, .logs-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left; vertical-align: top;
+}
+.logs-table th {
+  background: var(--surface-muted); font-weight: 600; color: var(--text-muted);
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em;
+}
+.logs-table .nowrap { white-space: nowrap; }
+.logs-table .arrow { margin: 0 6px; color: var(--text-muted); }
+
+/* ========================= Admin sections ========================= */
+.admin-section { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+.admin-section:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.admin-section h3 { margin: 0 0 8px 0; font-size: 14px; }
+.small { font-size: 12px; }
+.admin-notif-list, .admin-snap-list {
+  list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px;
+}
+.admin-notif, .admin-snap {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  padding: 8px 10px; background: var(--surface-muted);
+  border: 1px solid var(--border); border-radius: 8px;
+  font-size: 13px;
+}
+.admin-notif code {
+  background: var(--surface); border: 1px solid var(--border);
+  padding: 1px 6px; border-radius: 4px; font-size: 12px;
+}
+.admin-notif pre { margin: 4px 0 0; white-space: pre-wrap; }
+
+/* ========================= Print ========================= */
+.print-root { display: none; }
+@media print {
+  body * { visibility: hidden; }
+  .print-root, .print-root * { visibility: visible; }
+  .print-root {
+    display: block;
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: 0.4in 0.5in;
+    color: #000; background: #fff;
+    font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
+    font-size: 10pt;
+  }
+  .print-brand { page-break-after: always; }
+  .print-brand:last-child { page-break-after: auto; }
+  .print-header { margin-bottom: 0.15in; padding-bottom: 0.08in; border-bottom: 2px solid #000; }
+  .print-header h1 { margin: 0; font-size: 20pt; letter-spacing: 0.02em; }
+  .print-header .meta { margin-top: 4px; font-size: 9pt; color: #444; }
+  .print-empty { margin: 0.2in 0; font-style: italic; color: #555; }
+  .print-table {
+    width: 100%; border-collapse: collapse;
+  }
+  .print-table th, .print-table td {
+    border: 1px solid #000;
+    padding: 4px 6px;
+    vertical-align: top;
+  }
+  .print-table th { background: #eee; font-weight: 600; text-align: left; }
+  .print-table .num { text-align: right; }
+  .print-table .col-check { width: 0.4in; }
+  .print-table .col-notes { width: 2.2in; }
+  .shell, .toast, .modal-backdrop, .shell-header, .shell-main { display: none !important; }
+}

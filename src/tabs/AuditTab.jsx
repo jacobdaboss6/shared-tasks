@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   listMonths, getActiveMonth, listMyAssignmentsForMonth,
-  listBrandChecklistForMonth, upsertBrandChecklist,
-  listModelChecklistForAssignments, upsertModelChecklist,
-  reconcileMonthModels,
+  listBrandChecklistForMonth, upsertBrandChecklist, listBrands,
+  getLatestSnapshot, createInventorySnapshot,
+  listInventoryRowsForSnapshot, listSnapshotBrandCodes,
+  createAdminNotifications, listProfiles,
 } from '../lib/db'
 import { parseInventoryFile } from '../lib/excel'
+import { subscribeToSnapshots } from '../lib/realtime'
+import PrintSheet from '../print/PrintSheet'
 
 const STATUSES = [
   { value: 'pending',     label: 'Pending' },
@@ -14,35 +17,77 @@ const STATUSES = [
   { value: 'skipped',     label: 'Skipped' },
 ]
 
-export default function AuditTab({ profile }) {
+function fmtTime(iso) {
+  if (!iso) return ''
+  return new Date(iso).toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  })
+}
+
+export default function AuditTab({ profile, isAdmin }) {
   const [months, setMonths]     = useState([])
   const [monthId, setMonthId]   = useState(null)
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState(null)
 
-  const [assignments, setAssignments] = useState([]) // my assignments for this month
-  const [brandChecklist, setBrandChecklist] = useState([]) // all rows for month (to show teammates' progress if wanted)
-  const [modelRows, setModelRows] = useState([]) // my model_checklist rows across my assignments
+  const [assignments, setAssignments]     = useState([])
+  const [brandChecklist, setBrandChecklist] = useState([])
 
-  const [info, setInfo] = useState(null)
-  const [importing, setImporting] = useState(false)
+  // Snapshot state.
+  const [latestSnapshot, setLatestSnapshot] = useState(null)
+  const [activeSnapshot, setActiveSnapshot] = useState(null)
+  const [uploaders, setUploaders]           = useState(new Map()) // id -> profile
+  const [importing, setImporting]           = useState(false)
+  const [info, setInfo]                     = useState(null)
+
+  // Print state.
+  const [selectedForPrint, setSelectedForPrint] = useState(new Set())
+  const [printRequest, setPrintRequest]         = useState(null) // { brands, meta, rows }
+  const [adminPrintBrandId, setAdminPrintBrandId] = useState('')
+  const [allBrands, setAllBrands] = useState([])
 
   const dropRef = useRef(null)
   const fileRef = useRef(null)
 
+  // ----- Boot -----
   useEffect(() => { boot() }, [])
   async function boot() {
     setLoading(true); setError(null)
     try {
-      const [ms, active] = await Promise.all([listMonths(), getActiveMonth()])
+      const [ms, active, latest, profs, brandList] = await Promise.all([
+        listMonths(),
+        getActiveMonth(),
+        getLatestSnapshot(),
+        listProfiles(),
+        listBrands(),
+      ])
       setMonths(ms)
       setMonthId(active?.id ?? ms[0]?.id ?? null)
+      setLatestSnapshot(latest)
+      setActiveSnapshot(latest)
+      setUploaders(new Map(profs.map((p) => [p.id, p])))
+      setAllBrands(brandList)
     } catch (e) { setError(e.message) }
     setLoading(false)
   }
 
+  // ----- Realtime: new snapshot from someone else -----
+  useEffect(() => {
+    const unsub = subscribeToSnapshots(async (snap) => {
+      // Refresh uploaders so we can display their name.
+      try {
+        const ps = await listProfiles()
+        setUploaders(new Map(ps.map((p) => [p.id, p])))
+      } catch { /* ignore */ }
+      setLatestSnapshot(snap)
+    })
+    return unsub
+  }, [])
+
+  // ----- Load assignments + checklist for selected month -----
   const loadMonthData = useCallback(async (mid) => {
-    if (!mid) { setAssignments([]); setBrandChecklist([]); setModelRows([]); return }
+    if (!mid) { setAssignments([]); setBrandChecklist([]); return }
     setError(null)
     try {
       const [mine, bc] = await Promise.all([
@@ -51,38 +96,24 @@ export default function AuditTab({ profile }) {
       ])
       setAssignments(mine)
       setBrandChecklist(bc)
-      const models = await listModelChecklistForAssignments(mine.map((a) => a.id))
-      setModelRows(models)
     } catch (e) { setError(e.message) }
   }, [])
-
   useEffect(() => { loadMonthData(monthId) }, [monthId, loadMonthData])
 
-  // Index brand checklist by assignment for quick status lookup.
   const bcByAssignment = useMemo(() => {
     const m = new Map()
     for (const r of brandChecklist) m.set(r.assignment_id, r)
     return m
   }, [brandChecklist])
 
-  const modelsByAssignment = useMemo(() => {
-    const m = new Map()
-    for (const r of modelRows) {
-      if (!m.has(r.assignment_id)) m.set(r.assignment_id, [])
-      m.get(r.assignment_id).push(r)
-    }
-    return m
-  }, [modelRows])
-
+  // ----- Status / notes updates -----
   async function updateBrandStatus(assignment_id, status) {
     const prev = bcByAssignment.get(assignment_id)
     try {
       await upsertBrandChecklist({ assignment_id, status, notes: prev?.notes ?? null })
       setBrandChecklist((rows) => {
         const i = rows.findIndex((r) => r.assignment_id === assignment_id)
-        if (i >= 0) {
-          const copy = [...rows]; copy[i] = { ...rows[i], status }; return copy
-        }
+        if (i >= 0) { const copy = [...rows]; copy[i] = { ...rows[i], status }; return copy }
         return [...rows, { assignment_id, status, notes: null }]
       })
     } catch (e) { setError(e.message) }
@@ -94,45 +125,51 @@ export default function AuditTab({ profile }) {
       await upsertBrandChecklist({ assignment_id, status: prev?.status ?? 'pending', notes })
       setBrandChecklist((rows) => {
         const i = rows.findIndex((r) => r.assignment_id === assignment_id)
-        if (i >= 0) {
-          const copy = [...rows]; copy[i] = { ...rows[i], notes }; return copy
-        }
+        if (i >= 0) { const copy = [...rows]; copy[i] = { ...rows[i], notes }; return copy }
         return [...rows, { assignment_id, status: 'pending', notes }]
       })
     } catch (e) { setError(e.message) }
   }
 
-  async function updateModel(row, patch) {
-    try {
-      await upsertModelChecklist({
-        id: row.id,
-        assignment_id: row.assignment_id,
-        model: row.model,
-        status: patch.status ?? row.status,
-        notes: patch.notes ?? row.notes,
-      })
-      setModelRows((rows) => rows.map((r) => r.id === row.id ? { ...r, ...patch } : r))
-    } catch (e) { setError(e.message) }
-  }
-
+  // ----- Inventory upload -----
   async function handleInventoryFile(file) {
-    if (!file || !monthId) return
+    if (!file) return
     setImporting(true); setError(null); setInfo(null)
     try {
-      const inventory = await parseInventoryFile(file)
-      const result = await reconcileMonthModels({
-        assignments: assignments.map((a) => ({ id: a.id, brand: a.brand })),
-        inventoryRows: inventory,
-      })
-      setInfo(`Reconciled: ${result.inserted} new model(s), ${result.kept} kept, ${result.deleted} removed.`)
-      // Re-load models.
-      const models = await listModelChecklistForAssignments(assignments.map((a) => a.id))
-      setModelRows(models)
-    } catch (e) { setError(e.message) }
-    setImporting(false)
+      const rows = await parseInventoryFile(file)
+      if (!rows.length) throw new Error('No rows found in that file.')
+      const snap = await createInventorySnapshot({ filename: file.name, rows })
+
+      // Unrecognized-brand detection.
+      const snapBrandCodes = await listSnapshotBrandCodes(snap.id)
+      const knownNorm = new Set(allBrands.map((b) => b.normalized))
+      const unknown = snapBrandCodes.filter((s) => !knownNorm.has(s.brand_normalized))
+      if (unknown.length) {
+        await createAdminNotifications(unknown.map((u) => ({
+          kind: 'unrecognized_brand',
+          payload: {
+            brand_raw: u.brand_raw,
+            brand_normalized: u.brand_normalized,
+            snapshot_id: snap.id,
+            filename: file.name,
+          },
+        })))
+      }
+
+      setLatestSnapshot(snap)
+      setActiveSnapshot(snap)
+      setInfo(
+        `Uploaded ${rows.length} rows · ${snapBrandCodes.length} brands` +
+        (unknown.length ? ` · ${unknown.length} not in master list (admin notified)` : '')
+      )
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setImporting(false)
+    }
   }
 
-  // Drag-and-drop wiring for the inventory dropzone.
+  // Drag-and-drop wiring.
   useEffect(() => {
     const zone = dropRef.current
     if (!zone) return
@@ -158,9 +195,100 @@ export default function AuditTab({ profile }) {
       window.removeEventListener('dragover', onWindowDrop)
       window.removeEventListener('drop', onWindowDrop)
     }
-  }, [assignments, monthId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Progress rollups.
+  // ----- Print flow -----
+  function toggleSelected(assignmentId) {
+    setSelectedForPrint((s) => {
+      const n = new Set(s)
+      n.has(assignmentId) ? n.delete(assignmentId) : n.add(assignmentId)
+      return n
+    })
+  }
+
+  async function printAssignments(assignmentIds) {
+    if (!activeSnapshot) { setError('Upload an inventory file first.'); return }
+    const brands = assignments
+      .filter((a) => assignmentIds.includes(a.id))
+      .map((a) => ({ id: a.brand?.id, name: a.brand?.name, normalized: a.brand?.normalized }))
+      .filter((b) => b.normalized)
+    if (!brands.length) return
+    try {
+      const rows = await listInventoryRowsForSnapshot(
+        activeSnapshot.id, brands.map((b) => b.normalized)
+      )
+      // Group rows by normalized brand.
+      const byBrand = new Map()
+      for (const r of rows) {
+        const k = r.brand_normalized
+        if (!byBrand.has(k)) byBrand.set(k, [])
+        byBrand.get(k).push(r)
+      }
+      const sections = brands.map((b) => ({
+        brand: b,
+        rows: byBrand.get(b.normalized) || [],
+      }))
+      const monthLabel = months.find((m) => m.id === monthId)?.label || ''
+      setPrintRequest({
+        sections,
+        meta: {
+          personName: profile?.display_name || profile?.email || '',
+          monthLabel,
+          snapshotAt: activeSnapshot.uploaded_at,
+          uploader: uploaders.get(activeSnapshot.uploaded_by)?.display_name
+                 || uploaders.get(activeSnapshot.uploaded_by)?.email
+                 || '',
+        },
+      })
+    } catch (e) { setError(e.message) }
+  }
+
+  async function printAnyBrand() {
+    if (!adminPrintBrandId || !activeSnapshot) return
+    const b = allBrands.find((x) => x.id === adminPrintBrandId)
+    if (!b) return
+    try {
+      const rows = await listInventoryRowsForSnapshot(activeSnapshot.id, [b.normalized])
+      setPrintRequest({
+        sections: [{ brand: { name: b.name, normalized: b.normalized }, rows }],
+        meta: {
+          personName: '(admin)',
+          monthLabel: months.find((m) => m.id === monthId)?.label || '',
+          snapshotAt: activeSnapshot.uploaded_at,
+          uploader: uploaders.get(activeSnapshot.uploaded_by)?.display_name
+                 || uploaders.get(activeSnapshot.uploaded_by)?.email
+                 || '',
+        },
+      })
+    } catch (e) { setError(e.message) }
+  }
+
+  // Trigger the browser print dialog once printRequest is set and rendered.
+  useEffect(() => {
+    if (!printRequest) return
+    const t = setTimeout(() => { try { window.print() } catch { /* ignore */ } }, 50)
+    return () => clearTimeout(t)
+  }, [printRequest])
+
+  // Clear printRequest after print dialog closes.
+  useEffect(() => {
+    const onAfter = () => setPrintRequest(null)
+    window.addEventListener('afterprint', onAfter)
+    return () => window.removeEventListener('afterprint', onAfter)
+  }, [])
+
+  // ----- Snapshot banner -----
+  const uploaderName =
+    latestSnapshot
+      ? (uploaders.get(latestSnapshot.uploaded_by)?.display_name
+         || uploaders.get(latestSnapshot.uploaded_by)?.email
+         || 'someone')
+      : null
+  const isSnapshotStale = latestSnapshot
+    && activeSnapshot
+    && latestSnapshot.id !== activeSnapshot.id
+
+  // ----- Progress -----
   const progress = useMemo(() => {
     const total = assignments.length
     let done = 0, inProgress = 0
@@ -169,20 +297,72 @@ export default function AuditTab({ profile }) {
       if (s === 'done') done++
       else if (s === 'in_progress') inProgress++
     }
-    const totalModels = modelRows.length
-    const doneModels  = modelRows.filter((r) => r.status === 'done').length
-    return { total, done, inProgress, totalModels, doneModels }
-  }, [assignments, bcByAssignment, modelRows])
+    return { total, done, inProgress }
+  }, [assignments, bcByAssignment])
 
   if (loading) return <div className="state">Loading…</div>
 
-  const selectedMonthLabel = months.find((m) => m.id === monthId)?.label || '—'
+  const selectedMonth = months.find((m) => m.id === monthId)
+  const selectedMonthLabel = selectedMonth?.label || '—'
 
   return (
     <div className="tab audit-tab">
       {error && <div className="error">{error}</div>}
       {info  && <div className="info">{info}</div>}
 
+      {/* Snapshot banner */}
+      <section className="card snapshot-card">
+        <div className="card-head">
+          <h2>Inventory snapshot</h2>
+          {activeSnapshot ? (
+            <span className="muted">
+              {activeSnapshot.row_count} rows · uploaded by {uploaderName || '—'} at {fmtTime(activeSnapshot.uploaded_at)}
+            </span>
+          ) : (
+            <span className="muted">None uploaded yet</span>
+          )}
+        </div>
+        {isSnapshotStale && (
+          <div className="info warn">
+            A newer snapshot was uploaded by {
+              uploaders.get(latestSnapshot.uploaded_by)?.display_name
+              || uploaders.get(latestSnapshot.uploaded_by)?.email
+              || 'someone'
+            } at {fmtTime(latestSnapshot.uploaded_at)} ({latestSnapshot.row_count} rows).
+            <button className="mini" onClick={() => setActiveSnapshot(latestSnapshot)}>
+              Use new snapshot
+            </button>
+          </div>
+        )}
+        <div
+          ref={dropRef}
+          className="dropzone"
+          onClick={() => fileRef.current?.click()}
+          role="button"
+          tabIndex={0}
+        >
+          <strong>Click or drop a new inventory file</strong>
+          <span>.xlsx, .xls, or .csv — your teammates will be notified</span>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) handleInventoryFile(f)
+              e.target.value = ''
+            }}
+          />
+        </div>
+        {importing && <div className="state">Uploading…</div>}
+        <p className="hint">
+          <span style={{ color: '#c0392b' }}>Windows tip:</span> if the file picker hides your file,
+          switch its filter from “Custom” to <strong>All Files</strong>.
+        </p>
+      </section>
+
+      {/* Month + progress */}
       <section className="card">
         <div className="card-head">
           <h2>Your audit</h2>
@@ -194,7 +374,7 @@ export default function AuditTab({ profile }) {
             <select value={monthId ?? ''} onChange={(e) => setMonthId(e.target.value || null)}>
               {months.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.label}{m.is_active ? ' — active' : ''}
+                  {m.label}{m.is_active ? ' — active' : ''}{m.is_frozen ? ' — frozen' : ''}
                 </option>
               ))}
             </select>
@@ -210,56 +390,58 @@ export default function AuditTab({ profile }) {
             <span style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} />
           </div>
         </div>
-        {progress.totalModels > 0 && (
-          <div className="progress-row">
-            <span className="muted">Models: {progress.doneModels}/{progress.totalModels} done</span>
-            <div className="progress-bar">
-              <span style={{ width: `${progress.totalModels ? (progress.doneModels / progress.totalModels) * 100 : 0}%` }} />
-            </div>
+      </section>
+
+      {/* Admin "print any brand" */}
+      {isAdmin && (
+        <section className="card">
+          <div className="card-head">
+            <h2>Print any brand (admin)</h2>
+            <span className="muted">For walking a teammate's brand</span>
           </div>
-        )}
-      </section>
+          <div className="row">
+            <label className="field grow">
+              <span>Brand</span>
+              <select value={adminPrintBrandId} onChange={(e) => setAdminPrintBrandId(e.target.value)}>
+                <option value="">Pick one…</option>
+                {allBrands.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+              </select>
+            </label>
+            <button className="btn" onClick={printAnyBrand} disabled={!adminPrintBrandId || !activeSnapshot}>
+              Print
+            </button>
+          </div>
+        </section>
+      )}
 
-      <section className="card">
-        <div className="card-head">
-          <h2>Inventory import</h2>
-          <span className="muted">Adds/updates your model checklist from an inventory file.</span>
-        </div>
-        <div
-          ref={dropRef}
-          className="dropzone"
-          onClick={() => fileRef.current?.click()}
-          role="button"
-          tabIndex={0}
-        >
-          <strong>Click or drop</strong>
-          <span>.xlsx, .xls, or .csv — only your brands are read</span>
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".xlsx,.xls,.csv"
-            hidden
-            onChange={(e) => {
-              const f = e.target.files?.[0]
-              if (f) handleInventoryFile(f)
-              e.target.value = ''
-            }}
-          />
-        </div>
-        {importing && <div className="state">Parsing and reconciling…</div>}
-        <p className="hint">
-          <span style={{ color: '#c0392b' }}>Windows tip:</span> if the file picker hides your file, switch its filter from “Custom” to <strong>All Files</strong>.
-        </p>
-      </section>
-
+      {/* Your brands */}
       <section className="card">
         <div className="card-head">
           <h2>Your brands for {selectedMonthLabel}</h2>
           <span className="muted">{assignments.length} total</span>
         </div>
+        <div className="row">
+          <button
+            className="btn"
+            onClick={() => printAssignments([...selectedForPrint])}
+            disabled={!selectedForPrint.size || !activeSnapshot}
+          >
+            Print selected ({selectedForPrint.size})
+          </button>
+          <button
+            className="btn"
+            onClick={() => printAssignments(assignments.map((a) => a.id))}
+            disabled={!assignments.length || !activeSnapshot}
+          >
+            Print all my brands
+          </button>
+          {!activeSnapshot && (
+            <span className="muted">Upload an inventory file to enable printing.</span>
+          )}
+        </div>
         {assignments.length === 0 ? (
           <div className="state empty">
-            Nothing assigned to you for this month. An admin can run Randomize on the Randomize tab.
+            Nothing assigned to you for this month.
           </div>
         ) : (
           <ul className="audit-list">
@@ -267,10 +449,16 @@ export default function AuditTab({ profile }) {
               const bc = bcByAssignment.get(a.id)
               const status = bc?.status || 'pending'
               const notes  = bc?.notes  || ''
-              const models = modelsByAssignment.get(a.id) || []
               return (
                 <li key={a.id} className={`audit-row status-${status}`}>
                   <div className="audit-row-head">
+                    <label className="audit-check">
+                      <input
+                        type="checkbox"
+                        checked={selectedForPrint.has(a.id)}
+                        onChange={() => toggleSelected(a.id)}
+                      />
+                    </label>
                     <strong>{a.brand?.name || '(unknown)'}</strong>
                     <select
                       value={status}
@@ -280,6 +468,13 @@ export default function AuditTab({ profile }) {
                         <option key={s.value} value={s.value}>{s.label}</option>
                       ))}
                     </select>
+                    <button
+                      className="mini"
+                      onClick={() => printAssignments([a.id])}
+                      disabled={!activeSnapshot}
+                    >
+                      Print
+                    </button>
                   </div>
                   <textarea
                     className="notes"
@@ -289,43 +484,15 @@ export default function AuditTab({ profile }) {
                       if (e.target.value !== notes) updateBrandNotes(a.id, e.target.value || null)
                     }}
                   />
-                  {models.length > 0 && (
-                    <details className="models">
-                      <summary>
-                        {models.filter((m) => m.status === 'done').length}/{models.length} models
-                      </summary>
-                      <ul>
-                        {models.map((m) => (
-                          <li key={m.id} className={`status-${m.status}`}>
-                            <label className="model-line">
-                              <input
-                                type="checkbox"
-                                checked={m.status === 'done'}
-                                onChange={(e) =>
-                                  updateModel(m, { status: e.target.checked ? 'done' : 'pending' })
-                                }
-                              />
-                              <span>{m.model}</span>
-                            </label>
-                            <select
-                              value={m.status}
-                              onChange={(e) => updateModel(m, { status: e.target.value })}
-                            >
-                              {STATUSES.map((s) => (
-                                <option key={s.value} value={s.value}>{s.label}</option>
-                              ))}
-                            </select>
-                          </li>
-                        ))}
-                      </ul>
-                    </details>
-                  )}
                 </li>
               )
             })}
           </ul>
         )}
       </section>
+
+      {/* Hidden print sheet */}
+      {printRequest && <PrintSheet request={printRequest} />}
     </div>
   )
 }
