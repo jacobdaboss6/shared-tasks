@@ -399,28 +399,29 @@ textarea { width: 100%; min-height: 60px; resize: vertical; }
 }
 .admin-notif pre { margin: 4px 0 0; white-space: pre-wrap; }
 
-/* ========================= Print ========================= */
+/* ========================= Print =========================
+ * .print-root is rendered via a React portal to document.body, so it is a
+ * sibling of .shell (not nested inside it). That lets us simply hide .shell
+ * and show .print-root during @media print, without the display:none
+ * cascading onto the print content. */
 .print-root { display: none; }
 @media print {
-  body * { visibility: hidden; }
-  .print-root, .print-root * { visibility: visible; }
+  @page { margin: 0.4in 0.5in; }
+  html, body { margin: 0; padding: 0; background: #fff; }
+  .shell, .toast, .modal-backdrop { display: none !important; }
   .print-root {
     display: block;
-    position: absolute; top: 0; left: 0; right: 0;
-    padding: 0.4in 0.5in;
     color: #000; background: #fff;
     font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
     font-size: 10pt;
   }
-  .print-brand { page-break-after: always; }
-  .print-brand:last-child { page-break-after: auto; }
+  .print-brand { page-break-after: always; break-after: page; }
+  .print-brand:last-child { page-break-after: auto; break-after: auto; }
   .print-header { margin-bottom: 0.15in; padding-bottom: 0.08in; border-bottom: 2px solid #000; }
   .print-header h1 { margin: 0; font-size: 20pt; letter-spacing: 0.02em; }
   .print-header .meta { margin-top: 4px; font-size: 9pt; color: #444; }
   .print-empty { margin: 0.2in 0; font-style: italic; color: #555; }
-  .print-table {
-    width: 100%; border-collapse: collapse;
-  }
+  .print-table { width: 100%; border-collapse: collapse; }
   .print-table th, .print-table td {
     border: 1px solid #000;
     padding: 4px 6px;
@@ -430,5 +431,4 @@ textarea { width: 100%; min-height: 60px; resize: vertical; }
   .print-table .num { text-align: right; }
   .print-table .col-check { width: 0.4in; }
   .print-table .col-notes { width: 2.2in; }
-  .shell, .toast, .modal-backdrop, .shell-header, .shell-main { display: none !important; }
 }

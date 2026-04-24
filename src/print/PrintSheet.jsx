@@ -1,3 +1,5 @@
+import { createPortal } from 'react-dom'
+
 function fmtSnapshotDate(iso) {
   if (!iso) return ''
   const d = new Date(iso)
@@ -7,11 +9,13 @@ function fmtSnapshotDate(iso) {
   })
 }
 
-// A print-only view. Hidden on screen via CSS; only visible when the browser
-// is rendering for print (see .print-root rules in App.css).
+// Rendered via a React portal into document.body so the sheet is NOT a
+// descendant of the app shell. That way, `@media print` can simply hide
+// `.shell` with display:none and show `.print-root` — without hiding the
+// print content along with it.
 export default function PrintSheet({ request }) {
   const { sections, meta } = request
-  return (
+  const node = (
     <div className="print-root" aria-hidden="true">
       {sections.map((s, idx) => (
         <section key={`${s.brand.normalized}-${idx}`} className="print-brand">
@@ -61,4 +65,6 @@ export default function PrintSheet({ request }) {
       ))}
     </div>
   )
+  if (typeof document === 'undefined') return null
+  return createPortal(node, document.body)
 }
